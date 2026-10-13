@@ -11,8 +11,9 @@
 name: retry-a1
 
 on:
+  # GitHub 예약 실행은 정시에 붐벼 밀리거나 빠지기 쉽다 — 정각을 피해 3분 어긋나게 둔다
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "3-59/10 * * * *"
   workflow_dispatch:
 
 permissions:
