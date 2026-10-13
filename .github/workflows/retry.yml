@@ -1,0 +1,129 @@
+# Oracle Always Free ARM(A1) 인스턴스가 「Out of capacity」로 막힐 때,
+# 자리가 날 때까지 일정 간격으로 생성을 다시 요청한다.
+#
+# - 이미 `nexus` 인스턴스가 있으면 아무것도 하지 않고 이 워크플로를 끈다.
+# - 용량 부족 · 요청 한도(429)는 정상 경로로 보고 조용히 끝낸다(실패 메일이 쌓이지 않게).
+# - 그 밖의 오류는 실패로 끝내 GitHub 이 메일로 알린다.
+# - 성공하면 이슈를 하나 열어 알리고(메일이 간다) 워크플로를 끈다.
+#
+# 비밀 값(Settings → Secrets → Actions):
+#   OCI_USER_OCID · OCI_TENANCY_OCID · OCI_FINGERPRINT · OCI_PRIVATE_KEY
+name: retry-a1
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: retry-a1
+  cancel-in-progress: false
+
+env:
+  OCI_REGION: ap-osaka-1
+  INSTANCE_NAME: nexus
+  SUBNET_NAME: public subnet-nexus-net
+  OCPUS: "2"
+  MEMORY_GB: "12"
+  BOOT_GB: "100"
+  SSH_PUBLIC_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPoYUS3IuK5wqVru5zlqzzhjom2uDTlVqsH/aoIJCkeH nexus-oracle
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: OCI CLI 설치
+        run: pip install --quiet oci-cli
+
+      - name: 인증 설정
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          key_file=~/.oci/key.pem
+          EOF
+          oci setup repair-file-permissions --file ~/.oci/config
+          oci setup repair-file-permissions --file ~/.oci/key.pem
+
+      - name: 생성 시도
+        id: launch
+        env:
+          TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          set -uo pipefail
+
+          existing=$(oci compute instance list --compartment-id "$TENANCY" --display-name "$INSTANCE_NAME" \
+            --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | length(@)" --raw-output)
+          if [ "${existing:-0}" != "0" ]; then
+            echo "이미 '$INSTANCE_NAME' 인스턴스가 있다 — 더 시도하지 않는다"
+            echo "result=exists" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ad=$(oci iam availability-domain list --compartment-id "$TENANCY" --query 'data[0].name' --raw-output)
+          subnet=$(oci network subnet list --compartment-id "$TENANCY" --display-name "$SUBNET_NAME" \
+            --query 'data[0].id' --raw-output)
+          image=$(oci compute image list --compartment-id "$TENANCY" \
+            --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+            --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC \
+            --query 'data[0].id' --raw-output)
+          if [ -z "$ad" ] || [ -z "$subnet" ] || [ "$subnet" = "null" ] || [ -z "$image" ] || [ "$image" = "null" ]; then
+            # 로그에 ID 를 싣지 않는다 — 무엇이 비었는지만 알린다
+            echo "::error::가용성 도메인 · 서브넷 · 이미지 중 찾지 못한 것이 있다 (ad=${ad:+있음} subnet=${subnet:+있음} image=${image:+있음})"
+            exit 1
+          fi
+
+          if out=$(oci compute instance launch \
+              --compartment-id "$TENANCY" \
+              --availability-domain "$ad" \
+              --display-name "$INSTANCE_NAME" \
+              --shape VM.Standard.A1.Flex \
+              --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORY_GB}" \
+              --image-id "$image" \
+              --boot-volume-size-in-gbs "$BOOT_GB" \
+              --subnet-id "$subnet" \
+              --assign-public-ip true \
+              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBLIC_KEY\"}" 2>&1); then
+            echo "생성 요청 성공"
+            echo "result=created" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 응답 원문은 로그에 싣지 않는다(ID 가 들어 있다). 오류 코드 · 메시지 줄만 남긴다
+          echo "$out" | grep -E '"(code|message|status)"' | sed -E 's/ocid1\.[a-z0-9.]+/<ocid>/g' | head -5
+          if echo "$out" | grep -qiE 'out of (host )?capacity|TooManyRequests|"status": 429'; then
+            echo "용량 부족 · 요청 한도 — 다음 차례에 다시"
+            echo "result=retry" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::예상하지 못한 오류"
+          exit 1
+
+      - name: 성공 알림 · 워크플로 끄기
+        if: steps.launch.outputs.result == 'created' || steps.launch.outputs.result == 'exists'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.launch.outputs.result }}
+        run: |
+          if [ "$RESULT" = "created" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "nexus 인스턴스 생성 요청 성공" \
+              --body "A1 인스턴스 '$INSTANCE_NAME' 생성 요청이 받아들여졌다. Oracle 콘솔에서 Running 과 공인 IP 를 확인할 것. 이 워크플로는 꺼졌다."
+          fi
+          gh workflow disable retry-a1 -R "$GITHUB_REPOSITORY"
