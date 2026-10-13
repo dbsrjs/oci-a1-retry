@@ -120,8 +120,10 @@ jobs:
 
             # 응답 원문은 로그에 싣지 않는다(ID 가 들어 있다). 오류 문구만 남긴다
             msg=$(echo "$out" | grep -oE '"message": "[^"]*"' | head -1 | sed -E 's/ocid1\.[a-z0-9.]+/<ocid>/g')
-            if echo "$out" | grep -qiE 'out of (host )?capacity|TooManyRequests|"status": 429'; then
-              echo "[$(date -u +%H:%M)] ${attempt}회째 — 용량 부족 · 요청 한도 ${msg}"
+            if echo "$out" | grep -qiE 'out of (host )?capacity'; then
+              echo "[$(date -u +%H:%M)] ${attempt}회째 — 자리 없음(용량 부족)"
+            elif echo "$out" | grep -qiE 'TooManyRequests|"status": 429'; then
+              echo "[$(date -u +%H:%M)] ${attempt}회째 — 요청이 너무 잦다는 응답(429), 다음에 다시"
             else
               echo "::error::예상하지 못한 오류 ${msg}"
               exit 1
